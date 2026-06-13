@@ -176,6 +176,23 @@ def _parse_args():
         metavar="NAME",
         help="Storage backend to use (default: config/env/detected/chroma)",
     )
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Start as persistent HTTP MCP server instead of stdio",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8282,
+        metavar="N",
+        help="Port for HTTP server (default: 8282)",
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Fork into background and write PID to ~/.mempalace-mcp.pid",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -3461,6 +3478,69 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
+def _run_http_server(port: int) -> None:
+    """Serve MCP over HTTP on localhost:<port>.
+
+    All JSON-RPC requests are routed through the same ``handle_request``
+    call (serialised by a lock) so there is exactly one ChromaDB client
+    and no concurrent write-lock contention regardless of how many SSH
+    sessions connect simultaneously.
+
+    Endpoints:
+        GET  /health  — liveness probe
+        POST /mcp     — JSON-RPC 2.0 MCP request/response
+    """
+    import http.server
+
+    _http_lock = threading.Lock()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # silence default access log
+            logger.debug("HTTP %s", fmt % args)
+
+        def _send_json(self, code: int, body: dict) -> None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path == "/health":
+                self._send_json(200, {"status": "ok"})
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != "/mcp":
+                self._send_json(404, {"error": "not found"})
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                request = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                return
+            with _http_lock:
+                response = handle_request(request)
+            if response is None:
+                # notifications have no response
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self._send_json(200, response)
+
+    bind_host = "0.0.0.0" if os.environ.get("MEMPALACE_HTTP_BIND_ALL") else "localhost"
+    httpd = http.server.HTTPServer((bind_host, port), _Handler)
+    logger.info("MemPalace MCP HTTP server listening on http://%s:%d/mcp", bind_host, port)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
@@ -3487,35 +3567,40 @@ def main():
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, OSError):
                 pass
-    logger.info("MemPalace MCP Server starting...")
-    # Pre-flight: probe HNSW capacity before any tool call so the warning
-    # is visible at startup rather than on first use (#1222). Pure
-    # filesystem read; never opens a chromadb client.
     _refresh_vector_disabled_flag()
-    # Opt-in: pre-load the embedder so the first chromadb-write tool call
-    # does not pay the ONNX/CoreML cold-load tax under the MCP client
-    # timeout (#1495). Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
-    # Idle auto-exit: release ChromaDB file handles from stale servers
-    # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
-    while True:
-        try:
-            line = sys.stdin.readline()
-            if not line:
+
+    if _args.http:
+        if _args.daemon:
+            import os as _os
+            _pid = _os.fork()
+            if _pid > 0:
+                _pidfile = _os.path.expanduser("~/.mempalace-mcp.pid")
+                with open(_pidfile, "w") as _f:
+                    _f.write(str(_pid))
+                sys.exit(0)
+        logger.info("MemPalace MCP HTTP server starting on port %d...", _args.port)
+        _run_http_server(_args.port)
+    else:
+        logger.info("MemPalace MCP Server starting (stdio)...")
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                request = json.loads(line)
+                response = handle_request(request)
+                if response is not None:
+                    sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
                 break
-            line = line.strip()
-            if not line:
-                continue
-            request = json.loads(line)
-            response = handle_request(request)
-            if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
+            except Exception as e:
+                logger.error(f"Server error: {e}")
 
 
 if __name__ == "__main__":
