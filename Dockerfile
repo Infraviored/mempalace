@@ -83,8 +83,13 @@ ENV HOME=/data \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Non-root user owning the data volume.
-RUN groupadd --gid 1000 mempalace \
+# Pick up Debian security fixes published after the base image was built
+# (e.g. apt/libapt-pkg CVE-2026-109518), then the non-root user owning the
+# data volume.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 mempalace \
     && useradd --uid 1000 --gid 1000 --home-dir /data --create-home mempalace
 
 WORKDIR /app
